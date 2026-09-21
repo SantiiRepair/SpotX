@@ -4922,6 +4922,110 @@ function Set-CrossfadeEnabledBinaryPatch {
         }
 }
 
+function Find-X64CrossfadeProductStateGatePatchLocation {
+    param(
+        [byte[]]$Bytes,
+        [object]$PeInfo
+    )
+
+    $context = Get-BinaryPatchContext -PeInfo $PeInfo
+
+    $anchorText = [Text.Encoding]::ASCII.GetBytes("enable-crossfade-product-state`0")
+    $anchorOffset = [BinaryScannerV3]::FindBytes($Bytes, $anchorText, 0)
+    if ($anchorOffset -lt 0) {
+        throw 'enable-crossfade-product-state anchor was not found'
+    }
+    if ([BinaryScannerV3]::FindBytes($Bytes, $anchorText, $anchorOffset + 1) -ge 0) {
+        throw 'enable-crossfade-product-state anchor was not found uniquely'
+    }
+    $anchorRva = Get-PERvaFromOffset -Sections $PeInfo.Sections -Offset $anchorOffset
+    if ($null -eq $anchorRva) {
+        throw 'enable-crossfade-product-state anchor RVA was not found'
+    }
+
+    $anchorRefs = @([BinaryScannerV3]::FindRipLeaRefs(
+        $Bytes,
+        [int]$context.Text.RawPtr,
+        [int]$context.Text.RawSize,
+        [int64]$anchorRva,
+        $context.RawPtrs,
+        $context.RawSizes,
+        $context.VirtualAddresses
+    ) | Select-Object -Unique)
+    if ($anchorRefs.Count -eq 0) {
+        throw 'No x64 code reference to enable-crossfade-product-state was found'
+    }
+    if ($anchorRefs.Count -ne 1) {
+        throw "Expected one x64 reference to enable-crossfade-product-state, found $($anchorRefs.Count)"
+    }
+
+    $leaOffset = [int]$anchorRefs[0]
+    $gatePattern = Convert-HexStringToBytes 'E8 00 00 00 00 85 C0 00 00'
+    $gateMask    = Convert-HexStringToBytes 'FF 00 00 00 00 FF FF 00 00'
+
+    $gateOffset = -1
+    for ($i = $leaOffset - 32; $i -le $leaOffset - 8; $i++) {
+        if ($i -lt [int]$context.Text.RawPtr) { continue }
+        if ([BinaryScannerV3]::MatchMaskedBytes($Bytes, $i, $gatePattern, $gateMask)) {
+            $gateOffset = $i
+            break
+        }
+    }
+    if ($gateOffset -lt 0) {
+        throw 'x64 crossfade product-state gate pattern (CALL / TEST EAX,EAX) was not found'
+    }
+
+    $jzOffset = $gateOffset + 7
+    $patchedBytes  = [byte[]]@(0x90, 0x90)
+    $patchRva = Get-PERvaFromOffset -Sections $PeInfo.Sections -Offset $jzOffset
+    if ($null -eq $patchRva) {
+        throw 'x64 crossfade product-state JZ offset RVA was not found'
+    }
+
+    if ([BinaryScannerV3]::MatchBytes($Bytes, $jzOffset, $patchedBytes)) {
+        $state = 'Patched'
+        $originalBytes = $null
+    } elseif ($Bytes[$jzOffset] -eq 0x74) {
+        $originalBytes = [byte[]]@($Bytes[$jzOffset], $Bytes[$jzOffset + 1])
+        $state = 'Original'
+    } else {
+        $unexpectedByte = $Bytes[$jzOffset].ToString('X2')
+        throw "Unexpected byte at crossfade product-state JZ offset: 0x$unexpectedByte"
+    }
+
+    return [PSCustomObject]@{
+        Architecture  = 'x64'
+        PatchOffset   = [int64]$jzOffset
+        OriginalBytes = $originalBytes
+        PatchedBytes  = $patchedBytes
+        State         = $state
+        AnchorRva     = [int64]$anchorRva
+    }
+}
+
+function Set-CrossfadeProductStateGatePatch {
+    [CmdletBinding()]
+    param (
+        [string]$FilePath
+    )
+
+    return Invoke-VerifiedBinaryPatch `
+        -FilePath $FilePath `
+        -PatchName 'crossfade_product_state_gate' `
+        -Locator {
+            param([byte[]]$Bytes, [object]$PeInfo)
+            if ($PeInfo.Architecture -ne 'x64') {
+                throw "Architecture $($PeInfo.Architecture) is not supported for crossfade_product_state_gate patch"
+            }
+            Find-X64CrossfadeProductStateGatePatchLocation -Bytes $Bytes -PeInfo $PeInfo
+        } `
+        -DescribeLocation {
+            param([object]$Location)
+            Write-Verbose ("crossfade_product_state_gate {0} JZ at offset 0x{1:X}" -f
+                $Location.Architecture, $Location.PatchOffset)
+        }
+}
+
 function Remove-Sign {
     [CmdletBinding()]
     param([string]$filePath)
@@ -5486,6 +5590,10 @@ if ($spotify_binary_bak -eq $dll_bak -and !$premium -and [version]$offline -ge [
 
 if ($spotify_binary_bak -eq $dll_bak -and !$premium -and [version]$offline -ge [version]'1.2.89') {
     $null = Set-CrossfadeEnabledBinaryPatch -FilePath $spotifyDll
+}
+
+if ($spotify_binary_bak -eq $dll_bak -and !$premium -and [version]$offline -ge [version]'1.3.0') {
+    $null = Set-CrossfadeProductStateGatePatch -FilePath $spotifyDll
 }
 
 # fix login for old versions
